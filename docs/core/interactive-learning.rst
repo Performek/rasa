@@ -7,6 +7,8 @@
 Interactive Learning
 ====================
 
+.. edit-link::
+
 This page shows how to use interactive learning on the command line.
 
 In interactive learning mode, you provide feedback to your bot while you talk
@@ -20,8 +22,12 @@ Some people call this `Software 2.0 <https://medium.com/@karpathy/software-2-0-a
 .. note::
 
     Rasa X provides a UI for interactive learning, and you can use any user conversation
-    as a starting point. See `Annotate Conversations <https://rasa.com/docs/rasa-x/annotate-conversations/>`_ in the Rasa X docs.
+    as a starting point. See
+    `Talking to Your Assistant <https://rasa.com/docs/rasa-x/user-guide/enable-workflows#talking-to-your-assistant/>`_
+    in the Rasa X docs.
 
+.. contents::
+   :local:
 
 Running Interactive Learning
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

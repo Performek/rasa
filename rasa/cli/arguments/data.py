@@ -4,7 +4,6 @@ from rasa.cli.arguments.default_arguments import (
     add_nlu_data_param,
     add_out_param,
     add_data_param,
-    add_stories_param,
     add_domain_param,
 )
 
@@ -40,6 +39,13 @@ def set_split_arguments(parser: argparse.ArgumentParser):
         help="Percentage of the data which should be in the training data.",
     )
 
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Seed to generate the same train/test split.",
+    )
+
     add_out_param(
         parser,
         default="train_test_split",
@@ -48,5 +54,12 @@ def set_split_arguments(parser: argparse.ArgumentParser):
 
 
 def set_validator_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--fail-on-warnings",
+        default=False,
+        action="store_true",
+        help="Fail validation on warnings and errors. "
+        "If omitted only errors will result in a non zero exit code.",
+    )
     add_domain_param(parser)
     add_data_param(parser)

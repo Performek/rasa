@@ -1,76 +1,48 @@
-# Create common base stage
-FROM python:3.6-slim as base
+# The default Docker image
+ARG IMAGE_BASE_NAME
+ARG BASE_IMAGE_HASH
+ARG BASE_BUILDER_IMAGE_HASH
 
+FROM ${IMAGE_BASE_NAME}:base-builder-${BASE_BUILDER_IMAGE_HASH} as builder
+# copy files
+COPY . /build/
+
+# change working directory
 WORKDIR /build
 
-# Create virtualenv to isolate builds
-RUN python -m venv /build
+# install dependencies
+RUN python -m venv /opt/venv && \
+  . /opt/venv/bin/activate && \
+  pip install --no-cache-dir -U "pip==22.*" -U "wheel>0.38.0" && \
+  poetry install --no-dev --no-root --no-interaction && \
+  poetry build -f wheel -n && \
+  pip install --no-deps dist/*.whl && \
+  rm -rf dist *.egg-info
 
-# Install common libraries
-RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends \
-    # required by psycopg2 at build and runtime
-    libpq-dev \
-     # required for health check
-    curl \
- && apt-get autoremove -y
+# start a new build stage
+FROM ${IMAGE_BASE_NAME}:base-${BASE_IMAGE_HASH} as runner
 
-# Make sure we use the virtualenv
-ENV PATH="/build/bin:$PATH"
+# copy everything from /opt
+COPY --from=builder /opt/venv /opt/venv
 
-# Stage to build and install everything
-FROM base as builder
+# make sure we use the virtualenv
+ENV PATH="/opt/venv/bin:$PATH"
 
-WORKDIR /src
+# set HOME environment variable
+ENV HOME=/app
 
-# Install all required build libraries
-RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends \
-    build-essential \
-    wget \
-    openssh-client \
-    graphviz-dev \
-    pkg-config \
-    git-core \
-    openssl \
-    libssl-dev \
-    libffi6 \
-    libffi-dev \
-    libpng-dev
-
-# Copy only what we really need
-COPY README.md .
-COPY setup.py .
-COPY setup.cfg .
-COPY MANIFEST.in .
-COPY requirements.txt .
-COPY LICENSE.txt .
-
-# Install dependencies
-RUN pip install -U pip && pip install --no-cache-dir -r requirements.txt
-
-# Install Rasa as package
-COPY rasa ./rasa
-RUN pip install .[sql]
-
-# Runtime stage which uses the virtualenv which we built in the previous stage
-FROM base AS runner
-
-# Copy virtualenv from previous stage
-COPY --from=builder /build /build
-
+# update permissions & change user to not run as root
 WORKDIR /app
-
-# Create a volume for temporary data
-VOLUME /tmp
-
-# Make sure the default group has the same permissions as the owner
-RUN chgrp -R 0 . && chmod -R g=u .
-
-# Don't run as root
+RUN chgrp -R 0 /app && chmod -R g=u /app && chmod o+wr /app
 USER 1001
 
-EXPOSE 5005
+# create a volume for temporary data
+VOLUME /tmp
 
+# change shell
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# the entry point
+EXPOSE 5005
 ENTRYPOINT ["rasa"]
 CMD ["--help"]

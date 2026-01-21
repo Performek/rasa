@@ -1,69 +1,100 @@
-import logging
-import os
+import copy
+from typing import Any, Callable, Dict, List, Text, Tuple, Type, Union
 
 import pytest
 
-from rasa.nlu import config, train
-from rasa.nlu.components import ComponentBuilder
-
-CONFIG_DEFAULTS_PATH = "sample_configs/config_defaults.yml"
-
-NLU_DEFAULT_CONFIG_PATH = "sample_configs/config_pretrained_embeddings_mitie.yml"
-
-DEFAULT_DATA_PATH = "data/examples/rasa/demo-rasa.json"
-
-NLU_MODEL_NAME = "nlu_model.tar.gz"
-
-MOODBOT_MODEL_PATH = "examples/moodbot/models/"
+from rasa.engine.graph import ExecutionContext, GraphComponent, GraphSchema
+from rasa.engine.storage.resource import Resource
+from rasa.engine.storage.storage import ModelStorage
+from rasa.nlu.featurizers.dense_featurizer.spacy_featurizer import SpacyFeaturizer
+from rasa.nlu.tokenizers.mitie_tokenizer import MitieTokenizer
+from rasa.nlu.tokenizers.spacy_tokenizer import SpacyTokenizer
+from rasa.shared.importers.rasa import RasaFileImporter
+from rasa.shared.nlu.training_data.message import Message
+from rasa.shared.nlu.training_data.training_data import TrainingData
+from rasa.utils.tensorflow.constants import EPOCHS, RANDOM_SEED
 
 
-@pytest.fixture(scope="session")
-def component_builder():
-    return ComponentBuilder()
-
-
-@pytest.fixture(scope="session")
-def spacy_nlp(component_builder, default_config):
-    spacy_nlp_config = {"name": "SpacyNLP"}
-    return component_builder.create_component(spacy_nlp_config, default_config).nlp
-
-
-@pytest.fixture(scope="session")
-def spacy_nlp_component(component_builder, default_config):
-    spacy_nlp_config = {"name": "SpacyNLP"}
-    return component_builder.create_component(spacy_nlp_config, default_config)
-
-
-@pytest.fixture(scope="session")
-def ner_crf_pos_feature_config():
+@pytest.fixture()
+def pretrained_embeddings_spacy_config() -> Dict:
     return {
-        "features": [
-            ["low", "title", "upper", "pos", "pos2"],
-            [
-                "bias",
-                "low",
-                "suffix3",
-                "suffix2",
-                "upper",
-                "title",
-                "digit",
-                "pos",
-                "pos2",
-                "pattern",
-            ],
-            ["low", "title", "upper", "pos", "pos2"],
-        ]
+        "assistant_id": "placeholder_default",
+        "language": "en",
+        "pipeline": [
+            {"name": "SpacyNLP", "model": "en_core_web_md"},
+            {"name": "SpacyTokenizer"},
+            {"name": "SpacyFeaturizer"},
+            {"name": "RegexFeaturizer"},
+            {"name": "CRFEntityExtractor", EPOCHS: 1, RANDOM_SEED: 42},
+            {"name": "EntitySynonymMapper"},
+            {"name": "SklearnIntentClassifier"},
+        ],
     }
 
 
-@pytest.fixture(scope="session")
-def mitie_feature_extractor(component_builder, default_config):
-    mitie_nlp_config = {"name": "MitieNLP"}
-    return component_builder.create_component(
-        mitie_nlp_config, default_config
-    ).extractor
+@pytest.fixture()
+def train_and_preprocess(
+    default_model_storage: ModelStorage,
+) -> Callable[..., Tuple[TrainingData, List[GraphComponent]]]:
+    def inner(
+        pipeline: List[Dict[Text, Any]], training_data: Union[Text, TrainingData]
+    ) -> Tuple[TrainingData, List[GraphComponent]]:
+
+        if isinstance(training_data, str):
+            importer = RasaFileImporter(training_data_paths=[training_data])
+            training_data: TrainingData = importer.get_nlu_data()
+
+        def create_component(
+            component_class: Type[GraphComponent], config: Dict[Text, Any], idx: int
+        ) -> GraphComponent:
+            node_name = f"{component_class.__name__}_{idx}"
+            execution_context = ExecutionContext(GraphSchema({}), node_name=node_name)
+            resource = Resource(node_name)
+            return component_class.create(
+                {**component_class.get_default_config(), **config},
+                default_model_storage,
+                resource,
+                execution_context,
+            )
+
+        component_pipeline = [
+            create_component(component.pop("component"), component, idx)
+            for idx, component in enumerate(copy.deepcopy(pipeline))
+        ]
+
+        for component in component_pipeline:
+            if hasattr(component, "train"):
+                component.train(training_data)
+            if hasattr(component, "process_training_data"):
+                component.process_training_data(training_data)
+
+        return training_data, component_pipeline
+
+    return inner
 
 
-@pytest.fixture(scope="session")
-def default_config():
-    return config.load(CONFIG_DEFAULTS_PATH)
+@pytest.fixture()
+def process_message(default_model_storage: ModelStorage) -> Callable[..., Message]:
+    def inner(loaded_pipeline: List[GraphComponent], message: Message) -> Message:
+
+        for component in loaded_pipeline:
+            component.process([message])
+
+        return message
+
+    return inner
+
+
+@pytest.fixture()
+def spacy_tokenizer() -> SpacyTokenizer:
+    return SpacyTokenizer(SpacyTokenizer.get_default_config())
+
+
+@pytest.fixture()
+def spacy_featurizer() -> SpacyFeaturizer:
+    return SpacyFeaturizer(SpacyFeaturizer.get_default_config(), name="SpacyFeaturizer")
+
+
+@pytest.fixture()
+def mitie_tokenizer() -> MitieTokenizer:
+    return MitieTokenizer(MitieTokenizer.get_default_config())

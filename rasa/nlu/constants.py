@@ -1,45 +1,77 @@
-TEXT_ATTRIBUTE = "text"
+import rasa.shared.nlu.constants
+from rasa.shared.nlu.constants import ENTITY_ATTRIBUTE_CONFIDENCE
 
-RESPONSE_KEY_ATTRIBUTE = "response_key"
+BILOU_ENTITIES = "bilou_entities"
+BILOU_ENTITIES_ROLE = "bilou_entities_role"
+BILOU_ENTITIES_GROUP = "bilou_entities_group"
 
-INTENT_ATTRIBUTE = "intent"
+ENTITY_ATTRIBUTE_CONFIDENCE_TYPE = (
+    f"{ENTITY_ATTRIBUTE_CONFIDENCE}_{rasa.shared.nlu.constants.ENTITY_ATTRIBUTE_TYPE}"
+)
+ENTITY_ATTRIBUTE_CONFIDENCE_GROUP = (
+    f"{ENTITY_ATTRIBUTE_CONFIDENCE}_{rasa.shared.nlu.constants.ENTITY_ATTRIBUTE_GROUP}"
+)
+ENTITY_ATTRIBUTE_CONFIDENCE_ROLE = (
+    f"{ENTITY_ATTRIBUTE_CONFIDENCE}_{rasa.shared.nlu.constants.ENTITY_ATTRIBUTE_ROLE}"
+)
 
-RESPONSE_ATTRIBUTE = "response"
+EXTRACTOR = "extractor"
 
-ENTITIES_ATTRIBUTE = "entities"
+PRETRAINED_EXTRACTORS = {"DucklingEntityExtractor", "SpacyEntityExtractor"}
 
-EXTRACTOR_ATTRIBUTE = "extractor"
+NUMBER_OF_SUB_TOKENS = "number_of_sub_tokens"
 
-PRETRAINED_EXTRACTORS = {"DucklingHTTPExtractor", "SpacyEntityExtractor"}
+MESSAGE_ATTRIBUTES = [
+    rasa.shared.nlu.constants.TEXT,
+    rasa.shared.nlu.constants.INTENT,
+    rasa.shared.nlu.constants.RESPONSE,
+    rasa.shared.nlu.constants.ACTION_NAME,
+    rasa.shared.nlu.constants.ACTION_TEXT,
+    rasa.shared.nlu.constants.INTENT_RESPONSE_KEY,
+]
+# the dense featurizable attributes are essentially text attributes
+DENSE_FEATURIZABLE_ATTRIBUTES = [
+    rasa.shared.nlu.constants.TEXT,
+    rasa.shared.nlu.constants.RESPONSE,
+    rasa.shared.nlu.constants.ACTION_TEXT,
+]
 
-CLS_TOKEN = "__CLS__"
-
-MESSAGE_ATTRIBUTES = [TEXT_ATTRIBUTE, INTENT_ATTRIBUTE, RESPONSE_ATTRIBUTE]
+LANGUAGE_MODEL_DOCS = {
+    rasa.shared.nlu.constants.TEXT: "text_language_model_doc",
+    rasa.shared.nlu.constants.RESPONSE: "response_language_model_doc",
+    rasa.shared.nlu.constants.ACTION_TEXT: "action_text_model_doc",
+}
+SPACY_DOCS = {
+    rasa.shared.nlu.constants.TEXT: "text_spacy_doc",
+    rasa.shared.nlu.constants.RESPONSE: "response_spacy_doc",
+    rasa.shared.nlu.constants.ACTION_TEXT: "action_text_spacy_doc",
+}
 
 TOKENS_NAMES = {
-    TEXT_ATTRIBUTE: "tokens",
-    INTENT_ATTRIBUTE: "intent_tokens",
-    RESPONSE_ATTRIBUTE: "response_tokens",
+    rasa.shared.nlu.constants.TEXT: "text_tokens",
+    rasa.shared.nlu.constants.INTENT: "intent_tokens",
+    rasa.shared.nlu.constants.RESPONSE: "response_tokens",
+    rasa.shared.nlu.constants.ACTION_NAME: "action_name_tokens",
+    rasa.shared.nlu.constants.ACTION_TEXT: "action_text_tokens",
+    rasa.shared.nlu.constants.INTENT_RESPONSE_KEY: "intent_response_key_tokens",
 }
 
-SPARSE_FEATURE_NAMES = {
-    TEXT_ATTRIBUTE: "text_sparse_features",
-    INTENT_ATTRIBUTE: "intent_sparse_features",
-    RESPONSE_ATTRIBUTE: "response_sparse_features",
-}
-
-DENSE_FEATURE_NAMES = {
-    TEXT_ATTRIBUTE: "text_dense_features",
-    INTENT_ATTRIBUTE: "intent_dense_features",
-    RESPONSE_ATTRIBUTE: "response_dense_features",
-}
-
-SPACY_DOCS = {TEXT_ATTRIBUTE: "spacy_doc", RESPONSE_ATTRIBUTE: "response_spacy_doc"}
-
-DENSE_FEATURIZABLE_ATTRIBUTES = [TEXT_ATTRIBUTE, RESPONSE_ATTRIBUTE]
+SEQUENCE_FEATURES = "sequence_features"
+SENTENCE_FEATURES = "sentence_features"
 
 RESPONSE_SELECTOR_PROPERTY_NAME = "response_selector"
-DEFAULT_OPEN_UTTERANCE_TYPE = "default"
-OPEN_UTTERANCE_PREDICTION_KEY = "response"
-OPEN_UTTERANCE_RANKING_KEY = "ranking"
+RESPONSE_SELECTOR_RETRIEVAL_INTENTS = "all_retrieval_intents"
+RESPONSE_SELECTOR_DEFAULT_INTENT = "default"
+RESPONSE_SELECTOR_PREDICTION_KEY = "response"
+RESPONSE_SELECTOR_RANKING_KEY = "ranking"
+RESPONSE_SELECTOR_RESPONSES_KEY = "responses"
+RESPONSE_SELECTOR_RESPONSE_TEMPLATES_KEY = "response_templates"
+RESPONSE_SELECTOR_UTTER_ACTION_KEY = "utter_action"
+RESPONSE_SELECTOR_TEMPLATE_NAME_KEY = "template_name"
 RESPONSE_IDENTIFIER_DELIMITER = "/"
+
+DEFAULT_TRANSFORMER_SIZE = 256
+
+FEATURIZER_CLASS_ALIAS = "alias"
+
+NO_LENGTH_RESTRICTION = -1

@@ -8,11 +8,19 @@ intents:
 slots:
   cuisine:
     type: text
+    mappings:
+      - type: from_entity
+        entity: cuisine
   location:
     type: text
+    mappings:
+      - type: from_entity
+        entity: cuisine
 
 entities:
  - name
+ - cuisine
+ - location
 
 responses:
   utter_greet:
@@ -21,11 +29,6 @@ responses:
     - text: goodbye :(
   utter_default:
     - text: default message
-
-actions:
-  - utter_default
-  - utter_greet
-  - utter_goodbye
 
 session_config:
   session_expiration_time: 60

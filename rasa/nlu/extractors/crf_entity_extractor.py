@@ -1,666 +1,717 @@
+from __future__ import annotations
+
 import logging
-import os
 import typing
+from collections import OrderedDict
+from enum import Enum
+from typing import Any, Dict, List, Optional, Text, Tuple, Callable, Type
+
 import numpy as np
-from typing import Any, Dict, List, Optional, Text, Tuple, Union, NamedTuple
 
-from rasa.nlu.config import InvalidConfigError, RasaNLUModelConfig
-from rasa.nlu.extractors import EntityExtractor
-from rasa.nlu.model import Metadata
-from rasa.nlu.tokenizers.tokenizer import Token
-from rasa.nlu.training_data import Message, TrainingData
-from rasa.nlu.constants import (
-    TOKENS_NAMES,
-    TEXT_ATTRIBUTE,
-    DENSE_FEATURE_NAMES,
-    SPACY_DOCS,
-    ENTITIES_ATTRIBUTE,
+import rasa.nlu.utils.bilou_utils as bilou_utils
+import rasa.shared.utils.io
+import rasa.utils.train_utils
+from rasa.engine.graph import GraphComponent, ExecutionContext
+from rasa.engine.recipes.default_recipe import DefaultV1Recipe
+from rasa.engine.storage.resource import Resource
+from rasa.engine.storage.storage import ModelStorage
+from rasa.nlu.constants import TOKENS_NAMES
+from rasa.nlu.extractors.extractor import EntityExtractorMixin
+from rasa.nlu.test import determine_token_labels
+from rasa.nlu.tokenizers.spacy_tokenizer import POS_TAG_KEY
+from rasa.nlu.tokenizers.tokenizer import Token, Tokenizer
+from rasa.shared.constants import DOCS_URL_COMPONENTS
+from rasa.shared.nlu.constants import (
+    TEXT,
+    ENTITIES,
+    ENTITY_ATTRIBUTE_TYPE,
+    ENTITY_ATTRIBUTE_GROUP,
+    ENTITY_ATTRIBUTE_ROLE,
+    NO_ENTITY_TAG,
+    SPLIT_ENTITIES_BY_COMMA,
+    SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
 )
-from rasa.constants import (
-    DOCS_BASE_URL,
-    DOCS_URL_TRAINING_DATA_NLU,
-    DOCS_URL_COMPONENTS,
-)
-from rasa.utils.common import raise_warning
-
-try:
-    import spacy
-except ImportError:
-    spacy = None
+from rasa.shared.nlu.training_data.message import Message
+from rasa.shared.nlu.training_data.training_data import TrainingData
+from rasa.utils.tensorflow.constants import BILOU_FLAG, FEATURIZERS
 
 logger = logging.getLogger(__name__)
 
 if typing.TYPE_CHECKING:
     from sklearn_crfsuite import CRF
-    from spacy.tokens import Doc
 
 
-class CRFToken(NamedTuple):
-    text: Text
-    tag: Text
-    entity: Text
-    pattern: Dict[Text, Any]
-    dense_features: np.ndarray
+CONFIG_FEATURES = "features"
 
 
-class CRFEntityExtractor(EntityExtractor):
+class CRFToken:
+    def __init__(
+        self,
+        text: Text,
+        pos_tag: Text,
+        pattern: Dict[Text, Any],
+        dense_features: np.ndarray,
+        entity_tag: Text,
+        entity_role_tag: Text,
+        entity_group_tag: Text,
+    ):
+        self.text = text
+        self.pos_tag = pos_tag
+        self.pattern = pattern
+        self.dense_features = dense_features
+        self.entity_tag = entity_tag
+        self.entity_role_tag = entity_role_tag
+        self.entity_group_tag = entity_group_tag
 
-    provides = [ENTITIES_ATTRIBUTE]
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "pos_tag": self.pos_tag,
+            "pattern": self.pattern,
+            "dense_features": [str(x) for x in list(self.dense_features)],
+            "entity_tag": self.entity_tag,
+            "entity_role_tag": self.entity_role_tag,
+            "entity_group_tag": self.entity_group_tag,
+        }
 
-    requires = [TOKENS_NAMES[TEXT_ATTRIBUTE]]
+    @classmethod
+    def create_from_dict(cls, data: Dict[str, Any]) -> "CRFToken":
+        return cls(
+            data["text"],
+            data["pos_tag"],
+            data["pattern"],
+            np.array([float(x) for x in data["dense_features"]]),
+            data["entity_tag"],
+            data["entity_role_tag"],
+            data["entity_group_tag"],
+        )
 
-    defaults = {
-        # BILOU_flag determines whether to use BILOU tagging or not.
-        # More rigorous however requires more examples per entity
-        # rule of thumb: use only if more than 100 egs. per entity
-        "BILOU_flag": True,
-        # crf_features is [before, word, after] array with before, word,
-        # after holding keys about which
-        # features to use for each word, for example, 'title' in
-        # array before will have the feature
-        # "is the preceding word in title case?"
-        # POS features require spaCy to be installed
-        "features": [
-            ["low", "title", "upper"],
-            [
-                "bias",
-                "low",
-                "prefix5",
-                "prefix2",
-                "suffix5",
-                "suffix3",
-                "suffix2",
-                "upper",
-                "title",
-                "digit",
-                "pattern",
+
+class CRFEntityExtractorOptions(str, Enum):
+    """Features that can be used for the 'CRFEntityExtractor'."""
+
+    PATTERN = "pattern"
+    LOW = "low"
+    TITLE = "title"
+    PREFIX5 = "prefix5"
+    PREFIX2 = "prefix2"
+    SUFFIX5 = "suffix5"
+    SUFFIX3 = "suffix3"
+    SUFFIX2 = "suffix2"
+    SUFFIX1 = "suffix1"
+    BIAS = "bias"
+    POS = "pos"
+    POS2 = "pos2"
+    UPPER = "upper"
+    DIGIT = "digit"
+    TEXT_DENSE_FEATURES = "text_dense_features"
+    ENTITY = "entity"
+
+
+@DefaultV1Recipe.register(
+    DefaultV1Recipe.ComponentType.ENTITY_EXTRACTOR, is_trainable=True
+)
+class CRFEntityExtractor(GraphComponent, EntityExtractorMixin):
+    """Implements conditional random fields (CRF) to do named entity recognition."""
+
+    CONFIG_FEATURES = "features"
+
+    function_dict: Dict[Text, Callable[[CRFToken], Any]] = {
+        CRFEntityExtractorOptions.LOW: lambda crf_token: crf_token.text.lower(),
+        CRFEntityExtractorOptions.TITLE: lambda crf_token: crf_token.text.istitle(),
+        CRFEntityExtractorOptions.PREFIX5: lambda crf_token: crf_token.text[:5],
+        CRFEntityExtractorOptions.PREFIX2: lambda crf_token: crf_token.text[:2],
+        CRFEntityExtractorOptions.SUFFIX5: lambda crf_token: crf_token.text[-5:],
+        CRFEntityExtractorOptions.SUFFIX3: lambda crf_token: crf_token.text[-3:],
+        CRFEntityExtractorOptions.SUFFIX2: lambda crf_token: crf_token.text[-2:],
+        CRFEntityExtractorOptions.SUFFIX1: lambda crf_token: crf_token.text[-1:],
+        CRFEntityExtractorOptions.BIAS: lambda _: "bias",
+        CRFEntityExtractorOptions.POS: lambda crf_token: crf_token.pos_tag,
+        CRFEntityExtractorOptions.POS2: lambda crf_token: crf_token.pos_tag[:2]
+        if crf_token.pos_tag is not None
+        else None,
+        CRFEntityExtractorOptions.UPPER: lambda crf_token: crf_token.text.isupper(),
+        CRFEntityExtractorOptions.DIGIT: lambda crf_token: crf_token.text.isdigit(),
+        CRFEntityExtractorOptions.PATTERN: lambda crf_token: crf_token.pattern,
+        CRFEntityExtractorOptions.TEXT_DENSE_FEATURES: (
+            lambda crf_token: CRFEntityExtractor._convert_dense_features_for_crfsuite(  # noqa: E501
+                crf_token
+            )
+        ),
+        CRFEntityExtractorOptions.ENTITY: lambda crf_token: crf_token.entity_tag,
+    }
+
+    @classmethod
+    def required_components(cls) -> List[Type]:
+        """Components that should be included in the pipeline before this component."""
+        return [Tokenizer]
+
+    @staticmethod
+    def get_default_config() -> Dict[Text, Any]:
+        """The component's default config (see parent class for full docstring)."""
+        return {
+            # BILOU_flag determines whether to use BILOU tagging or not.
+            # More rigorous however requires more examples per entity
+            # rule of thumb: use only if more than 100 egs. per entity
+            BILOU_FLAG: True,
+            # Split entities by comma, this makes sense e.g. for a list of ingredients
+            # in a recipie, but it doesn't make sense for the parts of an address
+            SPLIT_ENTITIES_BY_COMMA: True,
+            # crf_features is [before, token, after] array with before, token,
+            # after holding keys about which features to use for each token,
+            # for example, 'title' in array before will have the feature
+            # "is the preceding token in title case?"
+            # POS features require SpacyTokenizer
+            # pattern feature require RegexFeaturizer
+            CONFIG_FEATURES: [
+                [
+                    CRFEntityExtractorOptions.LOW,
+                    CRFEntityExtractorOptions.TITLE,
+                    CRFEntityExtractorOptions.UPPER,
+                ],
+                [
+                    CRFEntityExtractorOptions.LOW,
+                    CRFEntityExtractorOptions.BIAS,
+                    CRFEntityExtractorOptions.PREFIX5,
+                    CRFEntityExtractorOptions.PREFIX2,
+                    CRFEntityExtractorOptions.SUFFIX5,
+                    CRFEntityExtractorOptions.SUFFIX3,
+                    CRFEntityExtractorOptions.SUFFIX2,
+                    CRFEntityExtractorOptions.UPPER,
+                    CRFEntityExtractorOptions.TITLE,
+                    CRFEntityExtractorOptions.DIGIT,
+                    CRFEntityExtractorOptions.PATTERN,
+                ],
+                [
+                    CRFEntityExtractorOptions.LOW,
+                    CRFEntityExtractorOptions.TITLE,
+                    CRFEntityExtractorOptions.UPPER,
+                ],
             ],
-            ["low", "title", "upper"],
-        ],
-        # The maximum number of iterations for optimization algorithms.
-        "max_iterations": 50,
-        # weight of theL1 regularization
-        "L1_c": 0.1,
-        # weight of the L2 regularization
-        "L2_c": 0.1,
-    }
-
-    function_dict = {
-        "low": lambda crf_token: crf_token.text.lower(),  # pytype: disable=attribute-error
-        "title": lambda crf_token: crf_token.text.istitle(),  # pytype: disable=attribute-error
-        "prefix5": lambda crf_token: crf_token.text[:5],
-        "prefix2": lambda crf_token: crf_token.text[:2],
-        "suffix5": lambda crf_token: crf_token.text[-5:],
-        "suffix3": lambda crf_token: crf_token.text[-3:],
-        "suffix2": lambda crf_token: crf_token.text[-2:],
-        "suffix1": lambda crf_token: crf_token.text[-1:],
-        "pos": lambda crf_token: crf_token.tag,
-        "pos2": lambda crf_token: crf_token.tag[:2],
-        "bias": lambda crf_token: "bias",
-        "upper": lambda crf_token: crf_token.text.isupper(),  # pytype: disable=attribute-error
-        "digit": lambda crf_token: crf_token.text.isdigit(),  # pytype: disable=attribute-error
-        "pattern": lambda crf_token: crf_token.pattern,
-        "text_dense_features": lambda crf_token: crf_token.dense_features,
-    }
+            # The maximum number of iterations for optimization algorithms.
+            "max_iterations": 50,
+            # weight of the L1 regularization
+            "L1_c": 0.1,
+            # weight of the L2 regularization
+            "L2_c": 0.1,
+            # Name of dense featurizers to use.
+            # If list is empty all available dense features are used.
+            "featurizers": [],
+        }
 
     def __init__(
         self,
-        component_config: Optional[Dict[Text, Any]] = None,
-        ent_tagger: Optional["CRF"] = None,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        entity_taggers: Optional[Dict[Text, "CRF"]] = None,
     ) -> None:
+        """Creates an instance of entity extractor."""
+        self.component_config = config
+        self._model_storage = model_storage
+        self._resource = resource
 
-        super().__init__(component_config)
+        self.entity_taggers = entity_taggers
 
-        self.ent_tagger = ent_tagger
+        self.crf_order = [
+            ENTITY_ATTRIBUTE_TYPE,
+            ENTITY_ATTRIBUTE_ROLE,
+            ENTITY_ATTRIBUTE_GROUP,
+        ]
 
         self._validate_configuration()
 
-        self._check_pos_features_and_spacy()
-
-    def _check_pos_features_and_spacy(self) -> None:
-        import itertools
-
-        features = self.component_config.get("features", [])
-        fts = set(itertools.chain.from_iterable(features))
-        self.pos_features = "pos" in fts or "pos2" in fts
-        if self.pos_features:
-            self._check_spacy()
-
-    @staticmethod
-    def _check_spacy() -> None:
-        if spacy is None:
-            raise ImportError(
-                "Failed to import `spaCy`. "
-                "`spaCy` is required for POS features "
-                "See https://spacy.io/usage/ for installation"
-                "instructions."
-            )
+        self.split_entities_config = rasa.utils.train_utils.init_split_entities(
+            config[SPLIT_ENTITIES_BY_COMMA], SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE
+        )
 
     def _validate_configuration(self) -> None:
-        if len(self.component_config.get("features", [])) % 2 != 1:
+        if len(self.component_config.get(CONFIG_FEATURES, [])) % 2 != 1:
             raise ValueError(
                 "Need an odd number of crf feature lists to have a center word."
             )
 
     @classmethod
-    def required_packages(cls) -> List[Text]:
+    def create(
+        cls,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
+    ) -> CRFEntityExtractor:
+        """Creates a new untrained component (see parent class for full docstring)."""
+        return cls(config, model_storage, resource)
+
+    @staticmethod
+    def required_packages() -> List[Text]:
+        """Any extra python dependencies required for this component to run."""
         return ["sklearn_crfsuite", "sklearn"]
 
-    def train(
-        self, training_data: TrainingData, config: RasaNLUModelConfig, **kwargs: Any
-    ) -> None:
-
+    def train(self, training_data: TrainingData) -> Resource:
+        """Trains the extractor on a data set."""
         # checks whether there is at least one
         # example with an entity annotation
-        if training_data.entity_examples:
-            self._check_spacy_doc(training_data.training_examples[0])
-
-            # filter out pre-trained entity examples
-            filtered_entity_examples = self.filter_trainable_entities(
-                training_data.training_examples
+        if not training_data.entity_examples:
+            logger.debug(
+                "No training examples with entities present. Skip training"
+                "of 'CRFEntityExtractor'."
             )
+            return self._resource
 
-            # convert the dataset into features
-            # this will train on ALL examples, even the ones
-            # without annotations
-            dataset = self._create_dataset(filtered_entity_examples)
+        self.check_correct_entity_annotations(training_data)
 
-            self._train_model(dataset)
+        if self.component_config[BILOU_FLAG]:
+            bilou_utils.apply_bilou_schema(training_data)
 
-    def _create_dataset(self, examples: List[Message]) -> List[List[CRFToken]]:
-        dataset = []
+        # only keep the CRFs for tags we actually have training data for
+        self._update_crf_order(training_data)
 
-        for example in examples:
-            entity_offsets = self._convert_example(example)
-            dataset.append(self._from_json_to_crf(example, entity_offsets))
-
-        return dataset
-
-    def _check_spacy_doc(self, message: Message) -> None:
-        if self.pos_features and message.get(SPACY_DOCS[TEXT_ATTRIBUTE]) is None:
-            raise InvalidConfigError(
-                "Could not find `spacy_doc` attribute for "
-                "message {}\n"
-                "POS features require a pipeline component "
-                "that provides `spacy_doc` attributes, i.e. `SpacyNLP`. "
-                "See {}/nlu/choosing-a-pipeline/#pretrained-embeddings-spacy "
-                "for details".format(message.text, DOCS_BASE_URL)
+        # filter out pre-trained entity examples
+        entity_examples = self.filter_trainable_entities(training_data.nlu_examples)
+        entity_examples = [
+            message
+            for message in entity_examples
+            if message.features_present(
+                attribute=TEXT, featurizers=self.component_config.get(FEATURIZERS)
             )
+        ]
+        dataset = [self._convert_to_crf_tokens(example) for example in entity_examples]
 
-    def process(self, message: Message, **kwargs: Any) -> None:
-
-        self._check_spacy_doc(message)
-
-        extracted = self.add_extractor_name(self.extract_entities(message))
-        message.set(
-            ENTITIES_ATTRIBUTE,
-            message.get(ENTITIES_ATTRIBUTE, []) + extracted,
-            add_to_output=True,
+        self.entity_taggers = self.train_model(
+            dataset, self.component_config, self.crf_order
         )
 
-    @staticmethod
-    def _convert_example(example: Message) -> List[Tuple[int, int, Text]]:
-        def convert_entity(entity):
-            return entity["start"], entity["end"], entity["entity"]
+        self.persist(dataset)
 
-        return [convert_entity(ent) for ent in example.get(ENTITIES_ATTRIBUTE, [])]
+        return self._resource
+
+    def _update_crf_order(self, training_data: TrainingData) -> None:
+        """Train only CRFs we actually have training data for."""
+        _crf_order = []
+
+        for tag_name in self.crf_order:
+            if tag_name == ENTITY_ATTRIBUTE_TYPE and training_data.entities:
+                _crf_order.append(ENTITY_ATTRIBUTE_TYPE)
+            elif tag_name == ENTITY_ATTRIBUTE_ROLE and training_data.entity_roles:
+                _crf_order.append(ENTITY_ATTRIBUTE_ROLE)
+            elif tag_name == ENTITY_ATTRIBUTE_GROUP and training_data.entity_groups:
+                _crf_order.append(ENTITY_ATTRIBUTE_GROUP)
+
+        self.crf_order = _crf_order
+
+    def process(self, messages: List[Message]) -> List[Message]:
+        """Augments messages with entities."""
+        for message in messages:
+            entities = self.extract_entities(message)
+            entities = self.add_extractor_name(entities)
+            message.set(
+                ENTITIES, message.get(ENTITIES, []) + entities, add_to_output=True
+            )
+
+        return messages
 
     def extract_entities(self, message: Message) -> List[Dict[Text, Any]]:
-        """Take a sentence and return entities in json format"""
-
-        if self.ent_tagger is not None:
-            text_data = self._from_text_to_crf(message)
-            features = self._sentence_to_features(text_data)
-            ents = self.ent_tagger.predict_marginals_single(features)
-            return self._from_crf_to_json(message, ents)
-        else:
+        """Extract entities from the given message using the trained model(s)."""
+        if self.entity_taggers is None or not message.features_present(
+            attribute=TEXT, featurizers=self.component_config.get(FEATURIZERS)
+        ):
             return []
 
-    def most_likely_entity(self, idx: int, entities: List[Any]) -> Tuple[Text, Any]:
-        if len(entities) > idx:
-            entity_probs = entities[idx]
-        else:
-            entity_probs = None
-        if entity_probs:
-            label = max(entity_probs, key=lambda key: entity_probs[key])
-            if self.component_config["BILOU_flag"]:
-                # if we are using bilou flags, we will combine the prob
-                # of the B, I, L and U tags for an entity (so if we have a
-                # score of 60% for `B-address` and 40% and 30%
-                # for `I-address`, we will return 70%)
-                return (
-                    label,
-                    sum([v for k, v in entity_probs.items() if k[2:] == label[2:]]),
-                )
-            else:
-                return label, entity_probs[label]
-        else:
-            return "", 0.0
+        tokens = message.get(TOKENS_NAMES[TEXT])
+        crf_tokens = self._convert_to_crf_tokens(message)
 
-    def _create_entity_dict(
+        predictions: Dict[Text, List[Dict[Text, float]]] = {}
+        for tag_name, entity_tagger in self.entity_taggers.items():
+            # use predicted entity tags as features for second level CRFs
+            include_tag_features = tag_name != ENTITY_ATTRIBUTE_TYPE
+            if include_tag_features:
+                self._add_tag_to_crf_token(crf_tokens, predictions)
+
+            features = self._crf_tokens_to_features(
+                crf_tokens, self.component_config, include_tag_features
+            )
+            predictions[tag_name] = entity_tagger.predict_marginals_single(features)
+
+        # convert predictions into a list of tags and a list of confidences
+        tags, confidences = self._tag_confidences(tokens, predictions)
+
+        return self.convert_predictions_into_entities(
+            message.get(TEXT), tokens, tags, self.split_entities_config, confidences
+        )
+
+    def _add_tag_to_crf_token(
         self,
-        message: Message,
-        tokens: Union["Doc", List[Token]],
-        start: int,
-        end: int,
-        entity: str,
-        confidence: float,
-    ) -> Dict[Text, Any]:
-        if isinstance(tokens, list):  # tokens is a list of Token
-            _start = tokens[start].start
-            _end = tokens[end].end
-            value = tokens[start].text
-            value += "".join(
-                [
-                    message.text[tokens[i - 1].end : tokens[i].start] + tokens[i].text
-                    for i in range(start + 1, end + 1)
-                ]
-            )
-        else:  # tokens is a Doc
-            _start = tokens[start].idx
-            _end = tokens[start : end + 1].end_char
-            value = tokens[start : end + 1].text
+        crf_tokens: List[CRFToken],
+        predictions: Dict[Text, List[Dict[Text, float]]],
+    ) -> None:
+        """Add predicted entity tags to CRF tokens."""
+        if ENTITY_ATTRIBUTE_TYPE in predictions:
+            _tags, _ = self._most_likely_tag(predictions[ENTITY_ATTRIBUTE_TYPE])
+            for tag, token in zip(_tags, crf_tokens):
+                token.entity_tag = tag
 
-        return {
-            "start": _start,
-            "end": _end,
-            "value": value,
-            "entity": entity,
-            "confidence": confidence,
-        }
+    def _most_likely_tag(
+        self, predictions: List[Dict[Text, float]]
+    ) -> Tuple[List[Text], List[float]]:
+        """Get the entity tags with the highest confidence.
 
-    @staticmethod
-    def _entity_from_label(label) -> Text:
-        return label[2:]
+        Args:
+            predictions: list of mappings from entity tag to confidence value
 
-    @staticmethod
-    def _bilou_from_label(label) -> Optional[Text]:
-        if len(label) >= 2 and label[1] == "-":
-            return label[0].upper()
-        return None
+        Returns:
+            List of entity tags and list of confidence values.
+        """
+        _tags = []
+        _confidences = []
 
-    @staticmethod
-    def _tokens_without_cls(message: Message) -> List[Token]:
-        # [:-1] to remove the CLS token from the list of tokens
-        return message.get(TOKENS_NAMES[TEXT_ATTRIBUTE])[:-1]
+        for token_predictions in predictions:
+            tag = max(token_predictions, key=lambda key: token_predictions[key])
+            _tags.append(tag)
 
-    def _find_bilou_end(self, word_idx, entities) -> Any:
-        ent_word_idx = word_idx + 1
-        finished = False
-
-        # get information about the first word, tagged with `B-...`
-        label, confidence = self.most_likely_entity(word_idx, entities)
-        entity_label = self._entity_from_label(label)
-
-        while not finished:
-            label, label_confidence = self.most_likely_entity(ent_word_idx, entities)
-
-            confidence = min(confidence, label_confidence)
-
-            if label[2:] != entity_label:
-                # words are not tagged the same entity class
-                logger.debug(
-                    "Inconsistent BILOU tagging found, B- tag, L- "
-                    "tag pair encloses multiple entity classes.i.e. "
-                    "[B-a, I-b, L-a] instead of [B-a, I-a, L-a].\n"
-                    "Assuming B- class is correct."
+            if self.component_config[BILOU_FLAG]:
+                # if we are using BILOU flags, we will sum up the prob
+                # of the B, I, L and U tags for an entity
+                _confidences.append(
+                    sum(
+                        _confidence
+                        for _tag, _confidence in token_predictions.items()
+                        if bilou_utils.tag_without_prefix(tag)
+                        == bilou_utils.tag_without_prefix(_tag)
+                    )
                 )
-
-            if label.startswith("L-"):
-                # end of the entity
-                finished = True
-            elif label.startswith("I-"):
-                # middle part of the entity
-                ent_word_idx += 1
             else:
-                # entity not closed by an L- tag
-                finished = True
-                ent_word_idx -= 1
-                logger.debug(
-                    "Inconsistent BILOU tagging found, B- tag not "
-                    "closed by L- tag, i.e [B-a, I-a, O] instead of "
-                    "[B-a, L-a, O].\nAssuming last tag is L-"
+                _confidences.append(token_predictions[tag])
+
+        return _tags, _confidences
+
+    def _tag_confidences(
+        self, tokens: List[Token], predictions: Dict[Text, List[Dict[Text, float]]]
+    ) -> Tuple[Dict[Text, List[Text]], Dict[Text, List[float]]]:
+        """Get most likely tag predictions with confidence values for tokens."""
+        tags = {}
+        confidences = {}
+
+        for tag_name, predicted_tags in predictions.items():
+            if len(tokens) != len(predicted_tags):
+                raise Exception(
+                    "Inconsistency in amount of tokens between crfsuite and message"
                 )
-        return ent_word_idx, confidence
 
-    def _handle_bilou_label(
-        self, word_idx: int, entities: List[Any]
-    ) -> Tuple[Any, Any, Any]:
-        label, confidence = self.most_likely_entity(word_idx, entities)
-        entity_label = self._entity_from_label(label)
+            _tags, _confidences = self._most_likely_tag(predicted_tags)
 
-        if self._bilou_from_label(label) == "U":
-            return word_idx, confidence, entity_label
-
-        elif self._bilou_from_label(label) == "B":
-            # start of multi word-entity need to represent whole extent
-            ent_word_idx, confidence = self._find_bilou_end(word_idx, entities)
-            return ent_word_idx, confidence, entity_label
-
-        else:
-            return None, None, None
-
-    def _from_crf_to_json(
-        self, message: Message, entities: List[Any]
-    ) -> List[Dict[Text, Any]]:
-
-        if self.pos_features:
-            tokens = message.get(SPACY_DOCS[TEXT_ATTRIBUTE])
-        else:
-            tokens = self._tokens_without_cls(message)
-
-        if len(tokens) != len(entities):
-            raise Exception(
-                "Inconsistency in amount of tokens between crfsuite and message"
-            )
-
-        if self.component_config["BILOU_flag"]:
-            return self._convert_bilou_tagging_to_entity_result(
-                message, tokens, entities
-            )
-        else:
-            # not using BILOU tagging scheme, multi-word entities are split.
-            return self._convert_simple_tagging_to_entity_result(tokens, entities)
-
-    def _convert_bilou_tagging_to_entity_result(
-        self, message: Message, tokens: List[Token], entities: List[Dict[Text, float]]
-    ):
-        # using the BILOU tagging scheme
-        json_ents = []
-        word_idx = 0
-        while word_idx < len(tokens):
-            end_idx, confidence, entity_label = self._handle_bilou_label(
-                word_idx, entities
-            )
-
-            if end_idx is not None:
-                ent = self._create_entity_dict(
-                    message, tokens, word_idx, end_idx, entity_label, confidence
+            if self.component_config[BILOU_FLAG]:
+                _tags, _confidences = bilou_utils.ensure_consistent_bilou_tagging(
+                    _tags, _confidences
                 )
-                json_ents.append(ent)
-                word_idx = end_idx + 1
-            else:
-                word_idx += 1
-        return json_ents
 
-    def _convert_simple_tagging_to_entity_result(
-        self, tokens: List[Union[Token, Any]], entities: List[Any]
-    ) -> List[Dict[Text, Any]]:
-        json_ents = []
+            confidences[tag_name] = _confidences
+            tags[tag_name] = _tags
 
-        for word_idx in range(len(tokens)):
-            entity_label, confidence = self.most_likely_entity(word_idx, entities)
-            word = tokens[word_idx]
-            if entity_label != "O":
-                if self.pos_features and not isinstance(word, Token):
-                    start = word.idx
-                    end = word.idx + len(word)
-                else:
-                    start = word.start
-                    end = word.end
-                ent = {
-                    "start": start,
-                    "end": end,
-                    "value": word.text,
-                    "entity": entity_label,
-                    "confidence": confidence,
-                }
-                json_ents.append(ent)
-
-        return json_ents
+        return tags, confidences
 
     @classmethod
     def load(
         cls,
-        meta: Dict[Text, Any],
-        model_dir: Text = None,
-        model_metadata: Metadata = None,
-        cached_component: Optional["CRFEntityExtractor"] = None,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
         **kwargs: Any,
-    ) -> "CRFEntityExtractor":
-        from sklearn.externals import joblib
+    ) -> CRFEntityExtractor:
+        """Loads trained component (see parent class for full docstring)."""
+        try:
+            with model_storage.read_from(resource) as model_dir:
+                dataset = rasa.shared.utils.io.read_json_file(
+                    model_dir / "crf_dataset.json"
+                )
+                crf_order = rasa.shared.utils.io.read_json_file(
+                    model_dir / "crf_order.json"
+                )
 
-        file_name = meta.get("file")
-        model_file = os.path.join(model_dir, file_name)
+                dataset = [
+                    [CRFToken.create_from_dict(token_data) for token_data in sub_list]
+                    for sub_list in dataset
+                ]
 
-        if os.path.exists(model_file):
-            ent_tagger = joblib.load(model_file)
-            return cls(meta, ent_tagger)
-        else:
-            return cls(meta)
+                entity_taggers = cls.train_model(dataset, config, crf_order)
 
-    def persist(self, file_name: Text, model_dir: Text) -> Optional[Dict[Text, Any]]:
-        """Persist this model into the passed directory.
+                entity_extractor = cls(config, model_storage, resource, entity_taggers)
+                entity_extractor.crf_order = crf_order
+                return entity_extractor
+        except ValueError:
+            logger.warning(
+                f"Failed to load {cls.__name__} from model storage. Resource "
+                f"'{resource.name}' doesn't exist."
+            )
+            return cls(config, model_storage, resource)
 
-        Returns the metadata necessary to load the model again."""
+    def persist(self, dataset: List[List[CRFToken]]) -> None:
+        """Persist this model into the passed directory."""
+        with self._model_storage.write_to(self._resource) as model_dir:
+            data_to_store = [
+                [token.to_dict() for token in sub_list] for sub_list in dataset
+            ]
 
-        from sklearn.externals import joblib
+            rasa.shared.utils.io.dump_obj_as_json_to_file(
+                model_dir / "crf_dataset.json", data_to_store
+            )
+            rasa.shared.utils.io.dump_obj_as_json_to_file(
+                model_dir / "crf_order.json", self.crf_order
+            )
 
-        file_name = file_name + ".pkl"
-        if self.ent_tagger:
-            model_file_name = os.path.join(model_dir, file_name)
-            joblib.dump(self.ent_tagger, model_file_name)
-
-        return {"file": file_name}
-
-    def _sentence_to_features(self, sentence: List[CRFToken]) -> List[Dict[Text, Any]]:
-        """Convert a word into discrete features in self.crf_features,
-        including word before and word after."""
-
-        configured_features = self.component_config["features"]
+    @classmethod
+    def _crf_tokens_to_features(
+        cls,
+        crf_tokens: List[CRFToken],
+        config: Dict[str, Any],
+        include_tag_features: bool = False,
+    ) -> List[Dict[Text, Any]]:
+        """Convert the list of tokens into discrete features."""
+        configured_features = config[CONFIG_FEATURES]
         sentence_features = []
 
-        for word_idx in range(len(sentence)):
-            # word before(-1), current word(0), next word(+1)
-            feature_span = len(configured_features)
-            half_span = feature_span // 2
-            feature_range = range(-half_span, half_span + 1)
-            prefixes = [str(i) for i in feature_range]
-            word_features = {}
-            for f_i in feature_range:
-                if word_idx + f_i >= len(sentence):
-                    word_features["EOS"] = True
-                    # End Of Sentence
-                elif word_idx + f_i < 0:
-                    word_features["BOS"] = True
-                    # Beginning Of Sentence
-                else:
-                    word = sentence[word_idx + f_i]
-                    f_i_from_zero = f_i + half_span
-                    prefix = prefixes[f_i_from_zero]
-                    features = configured_features[f_i_from_zero]
-                    for feature in features:
-                        if feature == "pattern":
-                            # add all regexes as a feature
-                            regex_patterns = self.function_dict[feature](word)
-                            # pytype: disable=attribute-error
-                            for p_name, matched in regex_patterns.items():
-                                feature_name = prefix + ":" + feature + ":" + p_name
-                                word_features[feature_name] = matched
-                            # pytype: enable=attribute-error
-                        else:
-                            # append each feature to a feature vector
-                            value = self.function_dict[feature](word)
-                            word_features[prefix + ":" + feature] = value
-            sentence_features.append(word_features)
+        for token_idx in range(len(crf_tokens)):
+            # the features for the current token include features of the token
+            # before and after the current features (if defined in the config)
+            # token before (-1), current token (0), token after (+1)
+            window_size = len(configured_features)
+            half_window_size = window_size // 2
+            window_range = range(-half_window_size, half_window_size + 1)
+
+            token_features = cls._create_features_for_token(
+                crf_tokens,
+                token_idx,
+                half_window_size,
+                window_range,
+                include_tag_features,
+                config,
+            )
+
+            sentence_features.append(token_features)
+
         return sentence_features
 
-    @staticmethod
-    def _sentence_to_labels(
-        sentence: List[
-            Tuple[
-                Optional[Text],
-                Optional[Text],
-                Text,
-                Dict[Text, Any],
-                Optional[Dict[str, Any]],
-            ]
-        ],
-    ) -> List[Text]:
+    @classmethod
+    def _create_features_for_token(
+        cls,
+        crf_tokens: List[CRFToken],
+        token_idx: int,
+        half_window_size: int,
+        window_range: range,
+        include_tag_features: bool,
+        config: Dict[str, Any],
+    ) -> Dict[Text, Any]:
+        """Convert a token into discrete features including words before and after."""
+        configured_features = config[CONFIG_FEATURES]
+        prefixes = [str(i) for i in window_range]
 
-        return [label for _, _, label, _, _ in sentence]
+        token_features = {}
 
-    def _from_json_to_crf(
-        self, message: Message, entity_offsets: List[Tuple[int, int, Text]]
-    ) -> List[CRFToken]:
-        """Convert json examples to format of underlying crfsuite."""
+        # iterate over the tokens in the window range (-1, 0, +1) to collect the
+        # features for the token at token_idx
+        for pointer_position in window_range:
+            current_token_idx = token_idx + pointer_position
 
-        if self.pos_features:
-            from spacy.gold import GoldParse  # pytype: disable=import-error
-
-            doc_or_tokens = message.get(SPACY_DOCS[TEXT_ATTRIBUTE])
-            gold = GoldParse(doc_or_tokens, entities=entity_offsets)
-            ents = [l[5] for l in gold.orig_annot]
-        else:
-            doc_or_tokens = self._tokens_without_cls(message)
-            ents = self._bilou_tags_from_offsets(doc_or_tokens, entity_offsets)
-
-        # collect badly annotated examples
-        collected = []
-        for t, e in zip(doc_or_tokens, ents):
-            if e == "-":
-                collected.append(t)
-            elif collected:
-                collected_text = " ".join([t.text for t in collected])
-                raise_warning(
-                    f"Misaligned entity annotation for '{collected_text}' "
-                    f"in sentence '{message.text}' with intent "
-                    f"'{message.get('intent')}'. "
-                    f"Make sure the start and end values of the "
-                    f"annotated training examples end at token "
-                    f"boundaries (e.g. don't include trailing "
-                    f"whitespaces or punctuation).",
-                    docs=DOCS_URL_TRAINING_DATA_NLU,
-                )
-                collected = []
-
-        if not self.component_config["BILOU_flag"]:
-            for i, label in enumerate(ents):
-                if self._bilou_from_label(label) in {"B", "I", "U", "L"}:
-                    # removes BILOU prefix from label
-                    ents[i] = self._entity_from_label(label)
-
-        return self._from_text_to_crf(message, ents)
-
-    @staticmethod
-    def _bilou_tags_from_offsets(tokens, entities, missing: Text = "O") -> List[Text]:
-        # From spacy.spacy.GoldParse, under MIT License
-        starts = {token.start: i for i, token in enumerate(tokens)}
-        ends = {token.end: i for i, token in enumerate(tokens)}
-        bilou = ["-" for _ in tokens]
-        # Handle entity cases
-        for start_char, end_char, label in entities:
-            start_token = starts.get(start_char)
-            end_token = ends.get(end_char)
-            # Only interested if the tokenization is correct
-            if start_token is not None and end_token is not None:
-                if start_token == end_token:
-                    bilou[start_token] = "U-%s" % label
-                else:
-                    bilou[start_token] = "B-%s" % label
-                    for i in range(start_token + 1, end_token):
-                        bilou[i] = "I-%s" % label
-                    bilou[end_token] = "L-%s" % label
-        # Now distinguish the O cases from ones where we miss the tokenization
-        entity_chars = set()
-        for start_char, end_char, label in entities:
-            for i in range(start_char, end_char):
-                entity_chars.add(i)
-        for n, token in enumerate(tokens):
-            for i in range(token.start, token.end):
-                if i in entity_chars:
-                    break
+            if current_token_idx >= len(crf_tokens):
+                # token is at the end of the sentence
+                token_features["EOS"] = True
+            elif current_token_idx < 0:
+                # token is at the beginning of the sentence
+                token_features["BOS"] = True
             else:
-                bilou[n] = missing
+                token = crf_tokens[current_token_idx]
 
-        return bilou
+                # get the features to extract for the token we are currently looking at
+                current_feature_idx = pointer_position + half_window_size
+                features = configured_features[current_feature_idx]
+
+                prefix = prefixes[current_feature_idx]
+
+                # we add the 'entity' feature to include the entity type as features
+                # for the role and group CRFs
+                # (do not modify features, otherwise we will end up adding 'entity'
+                # over and over again, making training very slow)
+                additional_features = []
+                if include_tag_features:
+                    additional_features.append(CRFEntityExtractorOptions.ENTITY)
+
+                for feature in features + additional_features:
+                    if feature == CRFEntityExtractorOptions.PATTERN:
+                        # add all regexes extracted from the 'RegexFeaturizer' as a
+                        # feature: 'pattern_name' is the name of the pattern the user
+                        # set in the training data, 'matched' is either 'True' or
+                        # 'False' depending on whether the token actually matches the
+                        # pattern or not
+                        regex_patterns = cls.function_dict[feature](token)
+                        for pattern_name, matched in regex_patterns.items():
+                            token_features[
+                                f"{prefix}:{feature}:{pattern_name}"
+                            ] = matched
+                    else:
+                        value = cls.function_dict[feature](token)
+                        token_features[f"{prefix}:{feature}"] = value
+
+        return token_features
 
     @staticmethod
-    def __pattern_of_token(message: Message, i: int) -> Dict:
-        if message.get(TOKENS_NAMES[TEXT_ATTRIBUTE]) is not None:
-            return message.get(TOKENS_NAMES[TEXT_ATTRIBUTE])[i].get("pattern", {})
-        else:
-            return {}
+    def _crf_tokens_to_tags(crf_tokens: List[CRFToken], tag_name: Text) -> List[Text]:
+        """Return the list of tags for the given tag name."""
+        if tag_name == ENTITY_ATTRIBUTE_ROLE:
+            return [crf_token.entity_role_tag for crf_token in crf_tokens]
+        if tag_name == ENTITY_ATTRIBUTE_GROUP:
+            return [crf_token.entity_group_tag for crf_token in crf_tokens]
+
+        return [crf_token.entity_tag for crf_token in crf_tokens]
 
     @staticmethod
-    def __tag_of_token(token: Any) -> Text:
-        if spacy.about.__version__ > "2" and token._.has("tag"):
-            return token._.get("tag")
-        else:
-            return token.tag_
+    def _pattern_of_token(message: Message, idx: int) -> Dict[Text, bool]:
+        """Get the patterns of the token at the given index extracted by the
+        'RegexFeaturizer'.
 
-    @staticmethod
-    def __get_dense_features(message: Message) -> Optional[List[Any]]:
-        features = message.get(DENSE_FEATURE_NAMES[TEXT_ATTRIBUTE])
+        The 'RegexFeaturizer' adds all patterns listed in the training data to the
+        token. The pattern name is mapped to either 'True' (pattern applies to token) or
+        'False' (pattern does not apply to token).
+
+        Args:
+            message: The message.
+            idx: The token index.
+
+        Returns:
+            The pattern dict.
+        """
+        if message.get(TOKENS_NAMES[TEXT]) is not None:
+            return message.get(TOKENS_NAMES[TEXT])[idx].get(
+                CRFEntityExtractorOptions.PATTERN, {}
+            )
+        return {}
+
+    def _get_dense_features(self, message: Message) -> Optional[np.ndarray]:
+        """Convert dense features to python-crfsuite feature format."""
+        features, _ = message.get_dense_features(
+            TEXT, self.component_config["featurizers"]
+        )
 
         if features is None:
             return None
 
-        tokens = message.get(TOKENS_NAMES[TEXT_ATTRIBUTE], [])
-        if len(tokens) != len(features):
-            raise_warning(
-                f"Number of features ({len(features)}) for attribute "
-                f"'{DENSE_FEATURE_NAMES[TEXT_ATTRIBUTE]}' "
-                f"does not match number of tokens ({len(tokens)}). Set "
-                f"'return_sequence' to true in the corresponding featurizer in order "
-                f"to make use of the features in 'CRFEntityExtractor'.",
+        tokens = message.get(TOKENS_NAMES[TEXT])
+        if len(tokens) != len(features.features):
+            rasa.shared.utils.io.raise_warning(
+                f"Number of dense features ({len(features.features)}) for attribute "
+                f"'{TEXT}' does not match number of tokens ({len(tokens)}).",
                 docs=DOCS_URL_COMPONENTS + "#crfentityextractor",
             )
             return None
 
-        # convert to python-crfsuite feature format
-        features_out = []
-        for feature in features:
-            feature_dict = {
-                str(index): token_features
-                for index, token_features in enumerate(feature)
-            }
-            converted = {"text_dense_features": feature_dict}
-            features_out.append(converted)
-        return features_out
+        return features.features
 
-    def _from_text_to_crf(
-        self, message: Message, entities: List[Text] = None
-    ) -> List[CRFToken]:
-        """Takes a sentence and switches it to crfsuite format."""
+    @staticmethod
+    def _convert_dense_features_for_crfsuite(
+        crf_token: CRFToken,
+    ) -> Dict[Text, Dict[Text, float]]:
+        """Converts dense features of CRFTokens to dicts for the crfsuite."""
+        feature_dict = {
+            str(index): token_features
+            for index, token_features in enumerate(crf_token.dense_features)
+        }
+        converted = {"text_dense_features": feature_dict}
+        return converted
 
+    def _convert_to_crf_tokens(self, message: Message) -> List[CRFToken]:
+        """Take a message and convert it to crfsuite format."""
         crf_format = []
-        if self.pos_features:
-            tokens = message.get(SPACY_DOCS[TEXT_ATTRIBUTE])
-        else:
-            tokens = self._tokens_without_cls(message)
+        tokens = message.get(TOKENS_NAMES[TEXT])
 
-        text_dense_features = self.__get_dense_features(message)
+        text_dense_features = self._get_dense_features(message)
+        tags = self._get_tags(message)
 
         for i, token in enumerate(tokens):
-            pattern = self.__pattern_of_token(message, i)
-            entity = entities[i] if entities else "N/A"
-            tag = self.__tag_of_token(token) if self.pos_features else None
+            pattern = self._pattern_of_token(message, i)
+            entity = self.get_tag_for(tags, ENTITY_ATTRIBUTE_TYPE, i)
+            group = self.get_tag_for(tags, ENTITY_ATTRIBUTE_GROUP, i)
+            role = self.get_tag_for(tags, ENTITY_ATTRIBUTE_ROLE, i)
+            pos_tag = token.get(POS_TAG_KEY)
             dense_features = (
                 text_dense_features[i] if text_dense_features is not None else []
             )
 
             crf_format.append(
-                CRFToken(token.text, tag, entity, pattern, dense_features)
+                CRFToken(
+                    text=token.text,
+                    pos_tag=pos_tag,
+                    entity_tag=entity,
+                    entity_group_tag=group,
+                    entity_role_tag=role,
+                    pattern=pattern,
+                    dense_features=dense_features,
+                )
             )
 
         return crf_format
 
-    def _train_model(self, df_train: List[List[CRFToken]]) -> None:
+    def _get_tags(self, message: Message) -> Dict[Text, List[Text]]:
+        """Get assigned entity tags of message."""
+        tokens = message.get(TOKENS_NAMES[TEXT])
+        tags = {}
+
+        for tag_name in self.crf_order:
+            if self.component_config[BILOU_FLAG]:
+                bilou_key = bilou_utils.get_bilou_key_for_tag(tag_name)
+                if message.get(bilou_key):
+                    _tags = message.get(bilou_key)
+                else:
+                    _tags = [NO_ENTITY_TAG for _ in tokens]
+            else:
+                _tags = [
+                    determine_token_labels(
+                        token, message.get(ENTITIES), attribute_key=tag_name
+                    )
+                    for token in tokens
+                ]
+            tags[tag_name] = _tags
+
+        return tags
+
+    @classmethod
+    def train_model(
+        cls,
+        df_train: List[List[CRFToken]],
+        config: Dict[str, Any],
+        crf_order: List[str],
+    ) -> OrderedDict[str, CRF]:
         """Train the crf tagger based on the training data."""
         import sklearn_crfsuite
 
-        X_train = [self._sentence_to_features(sent) for sent in df_train]
-        y_train = [self._sentence_to_labels(sent) for sent in df_train]
-        self.ent_tagger = sklearn_crfsuite.CRF(
-            algorithm="lbfgs",
-            # coefficient for L1 penalty
-            c1=self.component_config["L1_c"],
-            # coefficient for L2 penalty
-            c2=self.component_config["L2_c"],
-            # stop earlier
-            max_iterations=self.component_config["max_iterations"],
-            # include transitions that are possible, but not observed
-            all_possible_transitions=True,
-        )
-        self.ent_tagger.fit(X_train, y_train)
+        entity_taggers = OrderedDict()
+
+        for tag_name in crf_order:
+            logger.debug(f"Training CRF for '{tag_name}'.")
+
+            # add entity tag features for second level CRFs
+            include_tag_features = tag_name != ENTITY_ATTRIBUTE_TYPE
+            X_train = (
+                cls._crf_tokens_to_features(sentence, config, include_tag_features)
+                for sentence in df_train
+            )
+            y_train = (
+                cls._crf_tokens_to_tags(sentence, tag_name) for sentence in df_train
+            )
+
+            entity_tagger = sklearn_crfsuite.CRF(
+                algorithm="lbfgs",
+                # coefficient for L1 penalty
+                c1=config["L1_c"],
+                # coefficient for L2 penalty
+                c2=config["L2_c"],
+                # stop earlier
+                max_iterations=config["max_iterations"],
+                # include transitions that are possible, but not observed
+                all_possible_transitions=True,
+            )
+            entity_tagger.fit(X_train, y_train)
+
+            entity_taggers[tag_name] = entity_tagger
+
+            logger.debug("Training finished.")
+
+        return entity_taggers
